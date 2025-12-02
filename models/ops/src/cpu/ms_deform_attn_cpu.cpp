@@ -23,7 +23,7 @@ ms_deform_attn_cpu_forward(
     const at::Tensor &attn_weight,
     const int im2col_step)
 {
-    AT_ERROR("Not implement on cpu");
+    TORCH_CHECK(false, "Not implement on cpu");
 }
 
 std::vector<at::Tensor>
@@ -36,6 +36,6 @@ ms_deform_attn_cpu_backward(
     const at::Tensor &grad_output,
     const int im2col_step)
 {
-    AT_ERROR("Not implement on cpu");
+    TORCH_CHECK(false, "Not implement on cpu");
 }
 
