@@ -29,6 +29,10 @@ class CocoDetection(TvCocoDetection):
                                             cache_mode=cache_mode, local_rank=local_rank, local_size=local_size)
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask(return_masks)
+        # 添加以下代码以减少数据集规模
+        # 例如，只使用前1000个样本
+        num_samples_to_use = 1000
+        self.ids = self.ids[:num_samples_to_use]
 
     def __getitem__(self, idx):
         img, target = super(CocoDetection, self).__getitem__(idx)

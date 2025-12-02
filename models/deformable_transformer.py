@@ -177,13 +177,13 @@ class DeformableTransformer(nn.Module):
             init_reference_out = reference_points
 
         # decoder
-        hs, inter_references = self.decoder(tgt, reference_points, memory,
+        hs, inter_references, exit_layers = self.decoder(tgt, reference_points, memory,
                                             spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten)
 
         inter_references_out = inter_references
         if self.two_stage:
-            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
-        return hs, init_reference_out, inter_references_out, None, None
+            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, exit_layers
+        return hs, init_reference_out, inter_references_out, None, None, exit_layers
 
 
 class DeformableTransformerEncoderLayer(nn.Module):
@@ -328,14 +328,39 @@ class DeformableTransformerDecoder(nn.Module):
 
         intermediate = []
         intermediate_reference_points = []
+        
+        # 2+2+2 structure configuration
+        stage_lengths = [2, 2, 2]
+        confidence_threshold = 0.95 # Reasonable threshold for early exit
+        
+        # Track active queries (True = keep processing, False = exited)
+        bs, num_queries, _ = tgt.shape
+        active_mask = torch.ones(bs, num_queries, dtype=torch.bool, device=tgt.device)
+        exit_layers = torch.full((bs, num_queries), self.num_layers - 1, dtype=torch.long, device=tgt.device)
+        
+        current_stage_idx = 0
+        layers_in_current_stage = 0
+
         for lid, layer in enumerate(self.layers):
+            # Optimization: If all queries exited, skip computation
+            if not active_mask.any():
+                if self.return_intermediate:
+                     intermediate.append(output)
+                     intermediate_reference_points.append(reference_points)
+                continue
+
             if reference_points.shape[-1] == 4:
                 reference_points_input = reference_points[:, :, None] \
                                          * torch.cat([src_valid_ratios, src_valid_ratios], -1)[:, None]
             else:
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
-            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask)
+            
+            # Run layer on all queries (masking updates later to simulate early exit)
+            output_layer = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask)
+
+            # Update output only for active queries
+            output = torch.where(active_mask.unsqueeze(-1), output_layer, output)
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
@@ -348,16 +373,44 @@ class DeformableTransformerDecoder(nn.Module):
                     new_reference_points = tmp
                     new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
                     new_reference_points = new_reference_points.sigmoid()
-                reference_points = new_reference_points.detach()
+                
+                # Update reference points only for active queries, but handle shape change
+                if reference_points.shape[-1] != new_reference_points.shape[-1]:
+                    reference_points = new_reference_points.detach()
+                else:
+                    reference_points = torch.where(active_mask.unsqueeze(-1), new_reference_points.detach(), reference_points)
 
             if self.return_intermediate:
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
+            
+            # Check for stage completion and update active_mask
+            layers_in_current_stage += 1
+            if current_stage_idx < len(stage_lengths) and layers_in_current_stage == stage_lengths[current_stage_idx]:
+                # End of stage, check confidence
+                if self.class_embed is not None:
+                    # Calculate confidence
+                    # class_embed[lid] is the classifier for this layer
+                    logits = self.class_embed[lid](output)
+                    probs = logits.sigmoid()
+                    top_scores, _ = probs.max(-1) # (bs, num_queries)
+                    
+                    # Identify high confidence queries among active ones
+                    high_conf_mask = (top_scores > confidence_threshold) & active_mask
+                    
+                    # Update exit layers
+                    exit_layers = torch.where(high_conf_mask, torch.full_like(exit_layers, lid), exit_layers)
+                    
+                    # Deactivate high confidence queries (early exit)
+                    active_mask = active_mask & (~high_conf_mask)
+                
+                current_stage_idx += 1
+                layers_in_current_stage = 0
 
         if self.return_intermediate:
-            return torch.stack(intermediate), torch.stack(intermediate_reference_points)
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points), exit_layers
 
-        return output, reference_points
+        return output, reference_points, exit_layers
 
 
 def _get_clones(module, N):

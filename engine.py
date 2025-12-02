@@ -62,17 +62,18 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         optimizer.zero_grad()
         losses.backward()
         if max_norm > 0:
-            grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         else:
-            grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
+            grad_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        metric_logger.update(grad_norm=grad_total_norm)
+        metric_logger.update(grad_norm=grad_norm)
 
         samples, targets = prefetcher.next()
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)

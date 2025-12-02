@@ -110,6 +110,10 @@ class DeformableDETR(nn.Module):
             self.transformer.decoder.class_embed = self.class_embed
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
+        
+        # Always assign class_embed and bbox_embed to decoder for early exit mechanism
+        self.transformer.decoder.class_embed = self.class_embed
+        self.transformer.decoder.bbox_embed = self.bbox_embed
 
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
@@ -154,7 +158,7 @@ class DeformableDETR(nn.Module):
         query_embeds = None
         if not self.two_stage:
             query_embeds = self.query_embed.weight
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds)
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, exit_layers = self.transformer(srcs, masks, pos, query_embeds)
 
         outputs_classes = []
         outputs_coords = []
@@ -177,7 +181,14 @@ class DeformableDETR(nn.Module):
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
 
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        # Gather final output based on exit_layers
+        # outputs_class: (num_layers, bs, num_queries, num_classes)
+        # exit_layers: (bs, num_queries)
+        
+        final_class = torch.gather(outputs_class, 0, exit_layers.unsqueeze(0).unsqueeze(-1).expand(-1, -1, -1, outputs_class.shape[-1])).squeeze(0)
+        final_coord = torch.gather(outputs_coord, 0, exit_layers.unsqueeze(0).unsqueeze(-1).expand(-1, -1, -1, outputs_coord.shape[-1])).squeeze(0)
+
+        out = {'pred_logits': final_class, 'pred_boxes': final_coord}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
