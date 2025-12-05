@@ -1,43 +1,58 @@
-FROM bit:5000/ubuntu18.04_cuda11.1_devel_cudnn8
+FROM bit:5000/ubuntu18.04_cuda10.1_devel_cudnn7
 
-# Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PATH="/usr/local/cuda/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
-# Force CUDA architecture for Ampere (RTX 3090) and others if needed, 
-# but PyTorch extension build usually detects it. 
-# However, setting TORCH_CUDA_ARCH_LIST helps.
-ENV TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6+PTX"
+# 防止 Python 在 add-apt-repository 时报编码错误
+ENV LC_ALL=C.UTF-8 
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip \
-    python3-dev \
-    git \
+# =========================================================
+# 步骤 1：重置源配置 + 重建目录 + 安装基础工具
+# =========================================================
+RUN rm -rf /etc/apt/sources.list.d && \
+    mkdir -p /etc/apt/sources.list.d && \
+    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ bionic main restricted universe multiverse" > /etc/apt/sources.list && \
+    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ bionic-updates main restricted universe multiverse" >> /etc/apt/sources.list && \
+    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ bionic-backports main restricted universe multiverse" >> /etc/apt/sources.list && \
+    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ bionic-security main restricted universe multiverse" >> /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    software-properties-common \
+    gpg-agent \
     build-essential \
+    curl \
+    git \
     libgl1-mesa-glx \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* 
 
-# Alias python to python3
-RUN ln -s /usr/bin/python3 /usr/bin/python
+# =========================================================
+# 步骤 2：安装 Python 3.8
+# =========================================================
+RUN add-apt-repository ppa:deadsnakes/ppa
 
-# Upgrade pip
-RUN pip3 install --no-cache-dir --upgrade pip
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.8 \
+    python3.8-dev \
+    python3.8-distutils \
+    && rm -rf /var/lib/apt/lists/* 
 
-# Install PyTorch and Torchvision (CUDA 11.1)
-# PyTorch 1.8.1 is compatible with CUDA 11.1 and supports RTX 3090
-RUN pip3 install --no-cache-dir torch==1.8.1+cu111 torchvision==0.9.1+cu111 -f https://download.pytorch.org/whl/torch_stable.html
+#RUN apt-get autoclean && apt-get autoremove
+# =========================================================
+# 步骤 3：配置 Python 环境
+# =========================================================
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.8 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.8 1
 
-# Copy requirements
-COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+# 安装 pip
+RUN curl -sS https://bootstrap.pypa.io/pip/3.8/get-pip.py | python3.8
 
-# Set working directory
-WORKDIR /workspace/Deformable-DETR
+# =========================================================
+# 步骤 4：安装 Python 依赖
+# =========================================================
+RUN pip install --no-cache-dir -i https://pypi.mirrors.ustc.edu.cn/simple/ \
+    cython \
+    numpy \
+    scipy \
+    tqdm \
+    pycocotools
 
-# Copy the rest of the project
-COPY . .
-
-# Compile custom operators
-RUN cd models/ops && sh make.sh
+WORKDIR /workspace
