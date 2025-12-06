@@ -1,56 +1,39 @@
-FROM bit:5000/ubuntu18.04_cuda10.1_devel_cudnn7
+# 1. 使用您指定的带有 PyTorch 2.6 的基础镜像
+FROM pytorch:2.6.0-cuda12.4-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive
-# 防止 Python 在 add-apt-repository 时报编码错误
-ENV LC_ALL=C.UTF-8 
 
 # =========================================================
-# 步骤 1：重置源配置 + 重建目录 + 安装基础工具
+# 步骤 1：更换 APT 源 (Ubuntu 22.04 Jammy)
 # =========================================================
+# PyTorch 官方镜像基于 Ubuntu 22.04
+# 我们先清理旧源，换成 USTC 的 http 源，确保 apt-get update 不会卡死
 RUN rm -rf /etc/apt/sources.list.d && \
     mkdir -p /etc/apt/sources.list.d && \
-    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ bionic main restricted universe multiverse" > /etc/apt/sources.list && \
-    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ bionic-updates main restricted universe multiverse" >> /etc/apt/sources.list && \
-    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ bionic-backports main restricted universe multiverse" >> /etc/apt/sources.list && \
-    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ bionic-security main restricted universe multiverse" >> /etc/apt/sources.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-    software-properties-common \
-    gpg-agent \
+    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ jammy main restricted universe multiverse" > /etc/apt/sources.list && \
+    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list && \
+    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ jammy-backports main restricted universe multiverse" >> /etc/apt/sources.list && \
+    echo "deb http://mirrors.ustc.edu.cn/ubuntu/ jammy-security main restricted universe multiverse" >> /etc/apt/sources.list
+
+# =========================================================
+# 步骤 2：安装系统级依赖
+# =========================================================
+# pycocotools 和 cv2 (opencv) 通常需要 libgl1 和 git
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    curl \
     git \
     libgl1-mesa-glx \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/* 
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
 # =========================================================
-# 步骤 2：安装 Python 3.8
+# 步骤 3：安装剩余 Python 库
 # =========================================================
-RUN add-apt-repository ppa:deadsnakes/ppa
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.8 \
-    python3.8-dev \
-    python3.8-distutils \
-    && rm -rf /var/lib/apt/lists/* 
-
-#RUN apt-get autoclean && apt-get autoremove
-# =========================================================
-# 步骤 3：配置 Python 环境
-# =========================================================
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.8 1 && \
-    update-alternatives --install /usr/bin/python python /usr/bin/python3.8 1
-
-# 安装 pip
-RUN curl -sS https://bootstrap.pypa.io/pip/3.8/get-pip.py | python3.8
-
-# =========================================================
-# 步骤 4：安装 Python 依赖
-# =========================================================
-RUN pip install --no-cache-dir -i https://pypi.mirrors.ustc.edu.cn/simple/ \
+# 基础镜像里已经有 torch, torchvision, torchaudio, numpy 了
+# 我们只需要补齐 pycocotools, tqdm, cython, scipy
+# 使用清华源加速，并使用 --no-cache-dir 节省空间
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
     cython \
-    numpy \
     scipy \
     tqdm \
     pycocotools
