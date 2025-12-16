@@ -101,11 +101,25 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
 
+    exit_layer_counts = {}
+    total_queries = 0
+
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
+
+        if 'exit_layers' in outputs:
+            exit_layers = outputs['exit_layers']
+            unique, counts = torch.unique(exit_layers, return_counts=True)
+            for u, c in zip(unique, counts):
+                layer_idx = u.item()
+                if layer_idx not in exit_layer_counts:
+                    exit_layer_counts[layer_idx] = 0
+                exit_layer_counts[layer_idx] += c.item()
+            total_queries += exit_layers.numel()
+
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
@@ -146,6 +160,30 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         coco_evaluator.synchronize_between_processes()
     if panoptic_evaluator is not None:
         panoptic_evaluator.synchronize_between_processes()
+
+    if total_queries > 0:
+        max_layer = 12
+        counts_tensor = torch.zeros(max_layer, dtype=torch.long, device=device)
+        for l, c in exit_layer_counts.items():
+            if l < max_layer:
+                counts_tensor[l] = c
+        
+        if utils.is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(counts_tensor)
+            total_queries_tensor = torch.tensor(total_queries, dtype=torch.long, device=device)
+            torch.distributed.all_reduce(total_queries_tensor)
+            total_queries = total_queries_tensor.item()
+
+        if utils.is_main_process():
+            print("\nExit Layer Statistics:")
+            remaining = total_queries
+            for l in range(max_layer):
+                count = counts_tensor[l].item()
+                if count > 0:
+                    abs_pct = 100.0 * count / total_queries
+                    cond_pct = 100.0 * count / remaining if remaining > 0 else 0.0
+                    print(f"Layer {l}: {count} queries exited (Absolute: {abs_pct:.2f}%, Conditional: {cond_pct:.2f}%)")
+                    remaining -= count
 
     # accumulate predictions from all images
     if coco_evaluator is not None:
