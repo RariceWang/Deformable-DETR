@@ -331,7 +331,7 @@ class DeformableTransformerDecoder(nn.Module):
         
         # 2+2+2 structure configuration
         stage_lengths = [2, 2, 2]
-        confidence_threshold = 0.95 # Reasonable threshold for early exit
+        confidence_threshold = 0.85 # Reasonable threshold for early exit
         
         # Track active queries (True = keep processing, False = exited)
         bs, num_queries, _ = tgt.shape
@@ -396,7 +396,7 @@ class DeformableTransformerDecoder(nn.Module):
                     top_scores, _ = probs.max(-1) # (bs, num_queries)
                     
                     # Identify high confidence queries among active ones
-                    high_conf_mask = (top_scores > confidence_threshold) & active_mask
+                    high_conf_mask = ((top_scores > confidence_threshold) | (top_scores < 0.2)) & active_mask
                     
                     # Update exit layers
                     exit_layers = torch.where(high_conf_mask, torch.full_like(exit_layers, lid), exit_layers)
