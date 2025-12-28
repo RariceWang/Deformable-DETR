@@ -182,8 +182,8 @@ class DeformableTransformer(nn.Module):
 
         inter_references_out = inter_references
         if self.two_stage:
-            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, exit_layers
-        return hs, init_reference_out, inter_references_out, None, None, exit_layers
+            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, exit_layers, memory, spatial_shapes, level_start_index, valid_ratios
+        return hs, init_reference_out, inter_references_out, None, None, exit_layers, memory, spatial_shapes, level_start_index, valid_ratios
 
 
 class DeformableTransformerEncoderLayer(nn.Module):
@@ -330,8 +330,8 @@ class DeformableTransformerDecoder(nn.Module):
         intermediate_reference_points = []
         
         # 2+2+2 structure configuration
-        stage_lengths = [2, 2, 2]
-        confidence_threshold = 0.95 # Reasonable threshold for early exit
+        stage_lengths = [5 , 1]
+        exit_proportion = 0.3 # Proportion of queries to exit at each stage
         
         # Track active queries (True = keep processing, False = exited)
         bs, num_queries, _ = tgt.shape
@@ -395,8 +395,24 @@ class DeformableTransformerDecoder(nn.Module):
                     probs = logits.sigmoid()
                     top_scores, _ = probs.max(-1) # (bs, num_queries)
                     
-                    # Identify high confidence queries among active ones
-                    high_conf_mask = (top_scores > confidence_threshold) & active_mask
+                    # Identify high confidence queries among active ones based on percentile
+                    high_conf_mask = torch.zeros_like(active_mask)
+                    for b in range(bs):
+                        active_indices = active_mask[b]
+                        if not active_indices.any():
+                            continue
+                        
+                        current_scores = top_scores[b, active_indices]
+                        num_active = current_scores.numel()
+                        num_exit = int(num_active * exit_proportion)
+                        
+                        if num_exit > 0:
+                            # Find the threshold score (the score at the (num_active - num_exit)-th position when sorted)
+                            # kthvalue finds the k-th smallest value.
+                            # We want the top num_exit scores.
+                            # So we want scores >= the (num_active - num_exit + 1)-th smallest score.
+                            threshold_val, _ = torch.kthvalue(current_scores, num_active - num_exit + 1)
+                            high_conf_mask[b, active_indices] = (current_scores >= threshold_val)
                     
                     # Update exit layers
                     exit_layers = torch.where(high_conf_mask, torch.full_like(exit_layers, lid), exit_layers)

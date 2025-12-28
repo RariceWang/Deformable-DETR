@@ -25,6 +25,7 @@ from .matcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
 from .deformable_transformer import build_deforamble_transformer
+from .re_attention import ReAttentionModule
 import copy
 
 
@@ -115,6 +116,22 @@ class DeformableDETR(nn.Module):
         self.transformer.decoder.class_embed = self.class_embed
         self.transformer.decoder.bbox_embed = self.bbox_embed
 
+        # Re-Attention Module
+        self.re_attention_k = 100 # Number of queries to refine
+        self.re_attention = ReAttentionModule(
+            d_model=hidden_dim,
+            n_heads=transformer.nhead,
+            n_levels=num_feature_levels,
+            n_points=4, # Default for Deformable DETR
+            d_ffn=transformer.decoder.layers[0].linear1.out_features, # Infer from decoder
+            dropout=transformer.decoder.layers[0].dropout1.p
+        )
+        self.re_attention_class_embed = copy.deepcopy(self.class_embed[0]) if isinstance(self.class_embed, nn.ModuleList) else copy.deepcopy(self.class_embed)
+        self.re_attention_bbox_embed = copy.deepcopy(self.bbox_embed[0]) if isinstance(self.bbox_embed, nn.ModuleList) else copy.deepcopy(self.bbox_embed)
+        # Initialize bias for re-attention bbox embed same as others
+        nn.init.constant_(self.re_attention_bbox_embed.layers[-1].bias.data[2:], -2.0)
+
+
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
@@ -142,7 +159,7 @@ class DeformableDETR(nn.Module):
             masks.append(mask)
             assert mask is not None
         if self.num_feature_levels > len(srcs):
-            _len_srcs = len(srcs)
+            _len_srcs = len(srcs), memory, spatial_shapes, level_start_index, valid_ratios
             for l in range(_len_srcs, self.num_feature_levels):
                 if l == _len_srcs:
                     src = self.input_proj[l](features[-1].tensors)
@@ -188,7 +205,42 @@ class DeformableDETR(nn.Module):
         final_class = torch.gather(outputs_class, 0, exit_layers.unsqueeze(0).unsqueeze(-1).expand(-1, -1, -1, outputs_class.shape[-1])).squeeze(0)
         final_coord = torch.gather(outputs_coord, 0, exit_layers.unsqueeze(0).unsqueeze(-1).expand(-1, -1, -1, outputs_coord.shape[-1])).squeeze(0)
 
+        # ----------------------------------------------------------------------------------------------------------------
+        # Re-Attention Mechanism
+        # ----------------------------------------------------------------------------------------------------------------
+        # 1. Selection: Select top-K queries based on classification confidence
+        probs = final_class.sigmoid().max(dim=-1).values # [bs, num_queries]
+        topk_values, topk_indexes = torch.topk(probs, self.re_attention_k, dim=1) # [bs, k]
+
+        # Gather corresponding query embeddings and predicted boxes
+        # hs[-1] is the output of the last decoder layer: [bs, num_queries, d_model]
+        selected_query_embed = torch.gather(hs[-1], 1, topk_indexes.unsqueeze(-1).expand(-1, -1, hs[-1].shape[-1]))
+        selected_boxes = torch.gather(final_coord, 1, topk_indexes.unsqueeze(-1).expand(-1, -1, 4))
+
+        # 2. Re-Attention
+        # Use predicted boxes (cx, cy, w, h) as reference points to attend to small areas
+        refined_query_embed = self.re_attention(
+            query=selected_query_embed,
+            reference_points=selected_boxes.detach(), # Detach to avoid gradient flow through box coordinates if not desired, or keep it. Usually detach for reference points.
+            src_flatten=memory,
+            src_spatial_shapes=spatial_shapes,
+            src_level_start_index=level_start_index
+        )
+
+        # 3. Refined Prediction
+        refined_class_logits = self.re_attention_class_embed(refined_query_embed)
+        refined_bbox_deltas = self.re_attention_bbox_embed(refined_query_embed)
+        
+        # Apply deltas to selected boxes (inverse sigmoid -> add delta -> sigmoid)
+        selected_boxes_inv = inverse_sigmoid(selected_boxes)
+        refined_boxes = (selected_boxes_inv + refined_bbox_deltas).sigmoid()
+
+        # 4. Merge results (Optional: overwrite or return as separate output)
+        # Here we return them as 'refined_outputs'
+        
         out = {'pred_logits': final_class, 'pred_boxes': final_coord}
+        out['refined_outputs'] = {'pred_logits': refined_class_logits, 'pred_boxes': refined_boxes, 'indexes': topk_indexes}
+        
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
