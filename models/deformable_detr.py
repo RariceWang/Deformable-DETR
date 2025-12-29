@@ -159,7 +159,7 @@ class DeformableDETR(nn.Module):
             masks.append(mask)
             assert mask is not None
         if self.num_feature_levels > len(srcs):
-            _len_srcs = len(srcs), memory, spatial_shapes, level_start_index, valid_ratios
+            _len_srcs = len(srcs)
             for l in range(_len_srcs, self.num_feature_levels):
                 if l == _len_srcs:
                     src = self.input_proj[l](features[-1].tensors)
@@ -175,7 +175,7 @@ class DeformableDETR(nn.Module):
         query_embeds = None
         if not self.two_stage:
             query_embeds = self.query_embed.weight
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, exit_layers = self.transformer(srcs, masks, pos, query_embeds)
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, exit_layers, memory, spatial_shapes, level_start_index, valid_ratios = self.transformer(srcs, masks, pos, query_embeds)
 
         outputs_classes = []
         outputs_coords = []
@@ -451,6 +451,19 @@ class SetCriterion(nn.Module):
                 l_dict = {k + f'_enc': v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
+        if 'refined_outputs' in outputs:
+            refined_outputs = outputs['refined_outputs']
+            indices = self.matcher(refined_outputs, targets)
+            for loss in self.losses:
+                if loss == 'masks':
+                    continue
+                kwargs = {}
+                if loss == 'labels':
+                    kwargs['log'] = False
+                l_dict = self.get_loss(loss, refined_outputs, targets, indices, num_boxes, **kwargs)
+                l_dict = {k + '_refined': v for k, v in l_dict.items()}
+                losses.update(l_dict)
+
         return losses
 
 
@@ -467,6 +480,13 @@ class PostProcess(nn.Module):
                           For visualization, this should be the image size after data augment, but before padding
         """
         out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
+
+        if 'refined_outputs' in outputs:
+            # If refined outputs exist, use them. 
+            # Note: refined_outputs usually contains top-K queries.
+            # We assume K is sufficient (e.g. 100) or we prefer high-quality subset.
+            out_logits = outputs['refined_outputs']['pred_logits']
+            out_bbox = outputs['refined_outputs']['pred_boxes']
 
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
@@ -531,6 +551,11 @@ def build(args):
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef
+    
+    # Add weights for refined outputs
+    refined_weight_dict = {k + '_refined': v for k, v in weight_dict.items() if k in ['loss_ce', 'loss_bbox', 'loss_giou']}
+    weight_dict.update(refined_weight_dict)
+
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}

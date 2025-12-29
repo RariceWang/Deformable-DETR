@@ -47,6 +47,8 @@ def get_args_parser():
     # Variants of Deformable DETR
     parser.add_argument('--with_box_refine', default=False, action='store_true')
     parser.add_argument('--two_stage', default=False, action='store_true')
+    parser.add_argument('--train_re_attention_only', default=False, action='store_true',
+                        help="Train only the re-attention module and its heads")
 
     # Model parameters
     parser.add_argument('--frozen_weights', type=str, default=None,
@@ -143,6 +145,14 @@ def main(args):
     random.seed(seed)
 
     model, criterion, postprocessors = build_model(args)
+    if args.train_re_attention_only:
+        print("Training ONLY the Re-Attention module. Freezing all other parameters.")
+        for n, p in model.named_parameters():
+            if 're_attention' in n:
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+
     model.to(device)
 
     model_without_ddp = model
