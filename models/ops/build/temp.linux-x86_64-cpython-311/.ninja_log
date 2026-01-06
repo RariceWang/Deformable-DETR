@@ -1,0 +1,5 @@
+# ninja log v5
+3	8489	1767667177567086000	/workspace/models/ops/build/temp.linux-x86_64-cpython-311/workspace/models/ops/src/cpu/ms_deform_attn_cpu.o	8c048b71077cd3ac
+5	23960	1767667193033348000	/workspace/models/ops/build/temp.linux-x86_64-cpython-311/workspace/models/ops/src/vision.o	392e408cea51f5b6
+60	32522	1767668579853781000	/workspace/models/ops/build/temp.linux-x86_64-cpython-311/workspace/models/ops/src/cuda/ms_deform_attn_cuda.o	70589e0d689d87e4
+74	33991	1767669189977126000	/workspace/models/ops/build/temp.linux-x86_64-cpython-311/workspace/models/ops/src/cuda/ms_deform_attn_cuda.o	70589e0d689d87e4
