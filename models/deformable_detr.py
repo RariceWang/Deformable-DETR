@@ -52,8 +52,15 @@ class DeformableDETR(nn.Module):
         self.transformer = transformer
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
-        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        # Dynamic Routing Step 1: Distribution Header
+        self.n_bins = 16
+        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4 * self.n_bins, 3)
         self.num_feature_levels = num_feature_levels
+        # Dynamic Routing Config
+        self.dynamic_routing = False # Default off, user enables it
+        self.thresh_cls = 0.7
+        self.thresh_uncertainty = 0.5
+        
         if not two_stage:
             self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
         if num_feature_levels > 1:
@@ -97,19 +104,19 @@ class DeformableDETR(nn.Module):
         if with_box_refine:
             self.class_embed = _get_clones(self.class_embed, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
-            nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
+            # nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
             # hack implementation for iterative bounding box refinement
             self.transformer.decoder.bbox_embed = self.bbox_embed
         else:
-            nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
+            # nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
             self.transformer.decoder.bbox_embed = None
         if two_stage:
             # hack implementation for two-stage
             self.transformer.decoder.class_embed = self.class_embed
-            for box_embed in self.bbox_embed:
-                nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
+            # for box_embed in self.bbox_embed:
+            #     nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
@@ -158,28 +165,168 @@ class DeformableDETR(nn.Module):
 
         outputs_classes = []
         outputs_coords = []
+        outputs_entropies = []
+        outputs_box_dist_logits = []
+        
+        # Dynamic Routing Buffers
+        final_class_dr = None
+        final_coord_dr = None
+        final_entropy_dr = None
+        final_dist_logits_dr = None
+        exit_mask = None
+        
+        # Statistics
+        exit_counts = [] # Number of queries exited at each layer
+
         for lvl in range(hs.shape[0]):
             if lvl == 0:
                 reference = init_reference
             else:
                 reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
+            # reference = inverse_sigmoid(reference)
             outputs_class = self.class_embed[lvl](hs[lvl])
-            tmp = self.bbox_embed[lvl](hs[lvl])
-            if reference.shape[-1] == 4:
-                tmp += reference
-            else:
-                assert reference.shape[-1] == 2
-                tmp[..., :2] += reference
-            outputs_coord = tmp.sigmoid()
+            # Distribution Head forward
+            logits = self.bbox_embed[lvl](hs[lvl])
+            # Only store if training or needed for debugging?
+            # Actually needed for dynamic routing update "flat_logits"
+            outputs_box_dist_logits.append(logits)
+            
+            B, N_q, _ = logits.shape
+            logits = logits.view(B, N_q, 4, self.n_bins)
+            probs = F.softmax(logits, dim=-1)
+            
+            # Dynamic Routing: Integration and Entropy
+            bins = torch.linspace(0, 1, self.n_bins, device=logits.device)
+            # l, t, r, b
+            deltas = torch.sum(probs * bins, dim=-1)
+            
+            eps = 1e-8
+            # Average entropy over 4 coords
+            entropy = -torch.sum(probs * torch.log(probs + eps), dim=-1).mean(dim=-1)
+            
+            # Convert l,t,r,b relative to reference to cx,cy,w,h
+            # Reference is in [0, 1]
+            ref_xy = reference[..., :2]
+            
+            x_min = ref_xy[..., 0] - deltas[..., 0]
+            y_min = ref_xy[..., 1] - deltas[..., 1]
+            x_max = ref_xy[..., 0] + deltas[..., 2]
+            y_max = ref_xy[..., 1] + deltas[..., 3]
+            
+            cx = (x_min + x_max) / 2
+            cy = (y_min + y_max) / 2
+            w = x_max - x_min
+            h = y_max - y_min
+            
+            outputs_coord = torch.stack([cx, cy, w, h], dim=-1)
+            
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
+            outputs_entropies.append(entropy)
+
+            # Dynamic Routing Update
+            if self.dynamic_routing:
+                # Score > thresh AND Entropy < thresh
+                probs_c = outputs_class.sigmoid()
+                scores, _ = probs_c.max(dim=-1) # [B, N]
+                can_exit = (scores > self.thresh_cls) & (entropy < self.thresh_uncertainty)
+                
+                # Flatten logits for DR buffer (C = 4*bins)
+                flat_logits = outputs_box_dist_logits[-1]
+
+                if final_class_dr is None:
+                    final_class_dr = outputs_class.clone()
+                    final_coord_dr = outputs_coord.clone()
+                    final_entropy_dr = entropy.clone()
+                    final_dist_logits_dr = flat_logits.clone()
+                    exit_mask = can_exit
+                    
+                    # Stats for Layer 0
+                    exit_counts.append(can_exit.sum().item())
+                else:
+                    # Update active queries (NOT exited)
+                    active = ~exit_mask
+                    
+                    # Identify NEWLY exited queries in this layer
+                    # Newly exited = Active AND Can Exit now
+                    newly_exited = active & can_exit
+                    exit_counts.append(newly_exited.sum().item())
+                    
+                    # If active, taking NEW value. If !active (exited), keep OLD value.
+                    final_class_dr = torch.where(active.unsqueeze(-1), outputs_class, final_class_dr)
+                    final_coord_dr = torch.where(active.unsqueeze(-1), outputs_coord, final_coord_dr)
+                    final_entropy_dr = torch.where(active, entropy, final_entropy_dr)
+                    final_dist_logits_dr = torch.where(active.unsqueeze(-1), flat_logits, final_dist_logits_dr)
+                    
+                    exit_mask = exit_mask | can_exit
+
+                # Early Exit: If all queries have exited, stop processing layers
+                if exit_mask.all():
+                    break
+                    
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
+        outputs_entropy = torch.stack(outputs_entropies)
+        outputs_box_dist_logits = torch.stack(outputs_box_dist_logits)
 
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        # Select Output
+        if self.dynamic_routing and final_class_dr is not None:
+             out_logits = final_class_dr
+             out_boxes = final_coord_dr
+             out_ent = final_entropy_dr
+             out_dist = final_dist_logits_dr
+             
+             # Calculate compute savings
+             # Total queries = B * N
+             total_queries = final_class_dr.shape[0] * final_class_dr.shape[1]
+             num_layers = hs.shape[0]
+             
+             # Calculate weighted depth
+             # Queries not exited by end are considered to exit at last layer (or never exited)
+             # But 'exit_counts' only tracks those meeting criteria.
+             # Remaining = Total - sum(exit_counts)
+             remaining = total_queries - sum(exit_counts)
+             
+             # Sum (count * layer_idx)
+             # Layer 0 cost = 1 unit? Or 0 if we consider relative?
+             # Let's say cost is proportional to layer index (6 layers -> costs 1, 2, 3, 4, 5, 6)
+             # Exit at layer L (0-indexed) means it consumed L+1 layers of decoder.
+             
+             total_cost = 0
+             for l_idx, count in enumerate(exit_counts):
+                 total_cost += count * (l_idx + 1)
+             
+             # Remaining queries went through all layers
+             total_cost += remaining * num_layers
+             
+             # Max possible cost
+             max_cost = total_queries * num_layers
+             
+             # Reduction
+             flops_reduction = 1.0 - (total_cost / max_cost)
+             avg_exit_layer = (total_cost / total_queries) - 1.0 # 0-indexed
+             
+             dr_stats = {
+                 'flops_reduction': flops_reduction,
+                 'exit_counts': exit_counts,
+                 'avg_exit_layer': avg_exit_layer
+             }
+        else:
+             out_logits = outputs_class[-1]
+             out_boxes = outputs_coord[-1]
+             out_ent = outputs_entropy[-1]
+             out_dist = outputs_box_dist_logits[-1]
+             dr_stats = {}
+
+        out = {
+            'pred_logits': out_logits,
+            'pred_boxes': out_boxes,
+            'pred_entropy': out_ent,
+            'pred_box_dist_logits': out_dist,
+            'dr_stats': dr_stats
+        }
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_entropy, outputs_box_dist_logits)
 
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
@@ -187,12 +334,15 @@ class DeformableDETR(nn.Module):
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_entropy=None, outputs_box_dist_logits=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b}
+        if outputs_entropy is None:
+             return [{'pred_logits': a, 'pred_boxes': b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+        return [{'pred_logits': a, 'pred_boxes': b, 'pred_entropy': c, 'pred_box_dist_logits': d}
+                for a, b, c, d in zip(outputs_class[:-1], outputs_coord[:-1], outputs_entropy[:-1], outputs_box_dist_logits[:-1])]
 
 
 class SetCriterion(nn.Module):
@@ -319,12 +469,56 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
+    def loss_distill(self, outputs, targets, indices, num_boxes):
+        """
+        Distillation loss between Layer-3 and Layer-6.
+        """
+        if 'aux_outputs' not in outputs or 'pred_box_dist_logits' not in outputs:
+            return {}
+            
+        losses = {}
+        # Layer 6 (Teacher) is in outputs['pred_box_dist_logits']
+        teacher_logits = outputs['pred_box_dist_logits'].detach()
+        
+        # Layer 3 (Student) is in outputs['aux_outputs'][2]['pred_box_dist_logits']
+        # Assuming we have enough layers
+        aux_outputs = outputs['aux_outputs']
+        if len(aux_outputs) <= 2:
+            return {}
+            
+        student_logits = aux_outputs[2]['pred_box_dist_logits']
+        
+        # Calculate KL(P_teacher_distribution || P_student_distribution)
+        # Note: we want Student to match Teacher.
+        # KL(T || S) = sum T log (T/S)
+        # Minimizing wrt S => - sum T log S = CrossEntropy(T, S)
+        # Pytorch KLDivLoss(log_probs_S, probs_T) = sum T (log T - log S) = KL(T || S)
+        
+        B, N, C = student_logits.shape
+        n_bins = C // 4
+        
+        # Flatten bins for computation? Or keep per coordinate?
+        # We want to match distribution per coordinate.
+        
+        s_logits = student_logits.view(B*N*4, n_bins)
+        t_logits = teacher_logits.view(B*N*4, n_bins)
+        
+        log_probs_s = F.log_softmax(s_logits, dim=-1)
+        probs_t = F.softmax(t_logits, dim=-1)
+        
+        # KLDivLoss 'batchmean' reduction divides by batch size.
+        loss = F.kl_div(log_probs_s, probs_t, reduction='batchmean')
+        
+        losses['loss_distill'] = loss
+        return losses
+
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
-            'masks': self.loss_masks
+            'masks': self.loss_masks,
+            'distill': self.loss_distill
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -460,11 +654,23 @@ def build(args):
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
     )
+    
+    # Configure Dynamic Routing
+    if hasattr(args, 'dynamic_routing'):
+        model.dynamic_routing = args.dynamic_routing
+        model.thresh_cls = args.thresh_cls
+        model.thresh_uncertainty = args.thresh_uncertainty
+
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
+    
+    # Add Distillation Weight
+    if hasattr(args, 'distill_loss_coef') and args.distill_loss_coef > 0:
+        weight_dict['loss_distill'] = args.distill_loss_coef
+
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef
@@ -477,6 +683,9 @@ def build(args):
         weight_dict.update(aux_weight_dict)
 
     losses = ['labels', 'boxes', 'cardinality']
+    if hasattr(args, 'distill_loss_coef') and args.distill_loss_coef > 0:
+        losses.append('distill')
+
     if args.masks:
         losses += ["masks"]
     # num_classes, matcher, weight_dict, losses, focal_alpha=0.25

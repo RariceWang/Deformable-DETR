@@ -33,7 +33,7 @@ def get_args_parser():
     parser.add_argument('--lr_backbone', default=2e-5, type=float)
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
-    parser.add_argument('--batch_size', default=2, type=int)
+    parser.add_argument('--batch_size', default=1, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--lr_drop', default=40, type=int)
@@ -104,6 +104,16 @@ def get_args_parser():
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
+
+    # * Dynamic Routing & Distillation
+    parser.add_argument('--dynamic_routing', default=False, action='store_true',
+                        help="Enable uncertainty-aware dynamic routing during inference")
+    parser.add_argument('--thresh_cls', default=0.7, type=float,
+                        help="Confidence threshold for dynamic routing")
+    parser.add_argument('--thresh_uncertainty', default=0.5, type=float,
+                        help="Uncertainty (entropy) threshold for dynamic routing")
+    parser.add_argument('--distill_loss_coef', default=0.0, type=float,
+                        help="Coefficient for self-distillation loss (Layer-3 vs Layer-6)")
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
