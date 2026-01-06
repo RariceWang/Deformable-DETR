@@ -18,14 +18,14 @@ from torch.nn.init import xavier_uniform_, constant_, uniform_, normal_
 
 from util.misc import inverse_sigmoid
 from models.ops.modules import MSDeformAttn
-from .dist_utils import DistributionHead
+
 
 class DeformableTransformer(nn.Module):
     def __init__(self, d_model=256, nhead=8,
                  num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=1024, dropout=0.1,
                  activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
-                 two_stage=False, two_stage_num_proposals=300, n_bins=32):
+                 two_stage=False, two_stage_num_proposals=300):
         super().__init__()
 
         self.d_model = d_model
@@ -41,7 +41,7 @@ class DeformableTransformer(nn.Module):
         decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
                                                           num_feature_levels, nhead, dec_n_points)
-        self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec, n_bins=n_bins)
+        self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec)
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
 
@@ -159,21 +159,7 @@ class DeformableTransformer(nn.Module):
 
             # hack implementation for two-stage Deformable DETR
             enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
-            
-            # Support Distribution Head
-            enc_logits = self.decoder.bbox_embed[self.decoder.num_layers](output_memory)
-            box_vals, _, _ = self.decoder.dist_head(enc_logits)
-            
-            ref_proposals = output_proposals.sigmoid()
-            ref_cx, ref_cy = ref_proposals[..., 0], ref_proposals[..., 1]
-            l, t, r, b = box_vals.unbind(-1)
-            
-            new_cx = ref_cx + (r - l) * 0.5
-            new_cy = ref_cy + (b - t) * 0.5
-            new_w = l + r
-            new_h = t + b
-            enc_boxes = torch.stack([new_cx, new_cy, new_w, new_h], -1).clamp(1e-6, 1-1e-6)
-            enc_outputs_coord_unact = inverse_sigmoid(enc_boxes)
+            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
 
             topk = self.two_stage_num_proposals
             topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
@@ -327,7 +313,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
 
 class DeformableTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers, return_intermediate=False, n_bins=32):
+    def __init__(self, decoder_layer, num_layers, return_intermediate=False):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
@@ -335,8 +321,6 @@ class DeformableTransformerDecoder(nn.Module):
         # hack implementation for iterative bounding box refinement and two-stage Deformable DETR
         self.bbox_embed = None
         self.class_embed = None
-        self.n_bins = n_bins
-        self.dist_head = DistributionHead(reg_max=n_bins)
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
                 query_pos=None, src_padding_mask=None):
@@ -356,22 +340,14 @@ class DeformableTransformerDecoder(nn.Module):
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
                 tmp = self.bbox_embed[lid](output)
-                
-                # Distribution Refinement Logic
-                box_vals, entropy, _ = self.dist_head(tmp) # box_vals [B, Q, 4] (l, t, r, b)
-                
-                ref_cx, ref_cy = reference_points[..., 0], reference_points[..., 1]
-                
-                l, t, r, b = box_vals.unbind(-1)
-                
-                new_cx = ref_cx + (r - l) * 0.5
-                new_cy = ref_cy + (b - t) * 0.5
-                new_w = l + r
-                new_h = t + b
-                
-                new_reference_points = torch.stack([new_cx, new_cy, new_w, new_h], -1)
-                new_reference_points = new_reference_points.clamp(0, 1)
-
+                if reference_points.shape[-1] == 4:
+                    new_reference_points = tmp + inverse_sigmoid(reference_points)
+                    new_reference_points = new_reference_points.sigmoid()
+                else:
+                    assert reference_points.shape[-1] == 2
+                    new_reference_points = tmp
+                    new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
+                    new_reference_points = new_reference_points.sigmoid()
                 reference_points = new_reference_points.detach()
 
             if self.return_intermediate:
