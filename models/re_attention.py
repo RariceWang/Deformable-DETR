@@ -38,6 +38,12 @@ class ReAttentionModule(nn.Module):
         for m in self.modules():
             if isinstance(m, MSDeformAttn):
                 m._reset_parameters()
+        
+        # Zero initialization for identity mapping at the beginning of training
+        nn.init.constant_(self.linear2.weight, 0)
+        nn.init.constant_(self.linear2.bias, 0)
+        nn.init.constant_(self.cross_attn.output_proj.weight, 0)
+        nn.init.constant_(self.cross_attn.output_proj.bias, 0)
 
     def forward(self, query, reference_points, src_flatten, src_spatial_shapes, src_level_start_index, src_padding_mask=None):
         """
@@ -57,14 +63,17 @@ class ReAttentionModule(nn.Module):
              # (bs, num_queries, 4) -> (bs, num_queries, n_levels, 4)
              reference_points = reference_points.unsqueeze(2).repeat(1, 1, self.cross_attn.n_levels, 1)
         
-        src2 = self.cross_attn(query, reference_points, src_flatten, src_spatial_shapes, src_level_start_index, src_padding_mask)
+        # Pre-Norm Implementation for Identity Initialization
+        
+        # Cross Attention
+        query2 = self.norm1(query)
+        src2 = self.cross_attn(query2, reference_points, src_flatten, src_spatial_shapes, src_level_start_index, src_padding_mask)
         query = query + self.dropout1(src2)
-        query = self.norm1(query)
         
         # FFN
-        src2 = self.linear2(self.dropout2(self.activation(self.linear1(query))))
+        query2 = self.norm2(query)
+        src2 = self.linear2(self.dropout2(self.activation(self.linear1(query2))))
         query = query + self.dropout3(src2)
-        query = self.norm2(query)
         
         return query
 

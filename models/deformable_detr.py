@@ -117,8 +117,9 @@ class DeformableDETR(nn.Module):
         self.transformer.decoder.bbox_embed = self.bbox_embed
 
         # Re-Attention Module
-        self.re_attention_k = 100 # Number of queries to refine
-        self.re_attention = ReAttentionModule(
+        self.re_attention_k = 300 # Number of queries to refine
+        self.re_attention_layers = 2
+        re_attention_layer = ReAttentionModule(
             d_model=hidden_dim,
             n_heads=transformer.nhead,
             n_levels=num_feature_levels,
@@ -126,10 +127,17 @@ class DeformableDETR(nn.Module):
             d_ffn=transformer.decoder.layers[0].linear1.out_features, # Infer from decoder
             dropout=transformer.decoder.layers[0].dropout1.p
         )
-        self.re_attention_class_embed = copy.deepcopy(self.class_embed[0]) if isinstance(self.class_embed, nn.ModuleList) else copy.deepcopy(self.class_embed)
-        self.re_attention_bbox_embed = copy.deepcopy(self.bbox_embed[0]) if isinstance(self.bbox_embed, nn.ModuleList) else copy.deepcopy(self.bbox_embed)
-        # Initialize bias for re-attention bbox embed same as others
-        nn.init.constant_(self.re_attention_bbox_embed.layers[-1].bias.data[2:], -2.0)
+        self.re_attention = _get_clones(re_attention_layer, self.re_attention_layers)
+        
+        re_attn_class_embed_layer = copy.deepcopy(self.class_embed[-1]) if isinstance(self.class_embed, nn.ModuleList) else copy.deepcopy(self.class_embed)
+        re_attn_bbox_embed_layer = copy.deepcopy(self.bbox_embed[-1]) if isinstance(self.bbox_embed, nn.ModuleList) else copy.deepcopy(self.bbox_embed)
+        
+        # Zero-initialize the last layer of re-attention bbox embed to ensure identity transformation at the start
+        nn.init.constant_(re_attn_bbox_embed_layer.layers[-1].weight.data, 0)
+        nn.init.constant_(re_attn_bbox_embed_layer.layers[-1].bias.data, 0)
+
+        self.re_attention_class_embed = _get_clones(re_attn_class_embed_layer, self.re_attention_layers)
+        self.re_attention_bbox_embed = _get_clones(re_attn_bbox_embed_layer, self.re_attention_layers)
 
 
     def forward(self, samples: NestedTensor):
@@ -219,27 +227,41 @@ class DeformableDETR(nn.Module):
 
         # 2. Re-Attention
         # Use predicted boxes (cx, cy, w, h) as reference points to attend to small areas
-        refined_query_embed = self.re_attention(
-            query=selected_query_embed,
-            reference_points=selected_boxes.detach(), # Detach to avoid gradient flow through box coordinates if not desired, or keep it. Usually detach for reference points.
-            src_flatten=memory,
-            src_spatial_shapes=spatial_shapes,
-            src_level_start_index=level_start_index
-        )
-
-        # 3. Refined Prediction
-        refined_class_logits = self.re_attention_class_embed(refined_query_embed)
-        refined_bbox_deltas = self.re_attention_bbox_embed(refined_query_embed)
+        refined_query_embed = selected_query_embed
+        refined_references = selected_boxes # (bs, k, 4), sigmoid coords
         
-        # Apply deltas to selected boxes (inverse sigmoid -> add delta -> sigmoid)
-        selected_boxes_inv = inverse_sigmoid(selected_boxes)
-        refined_boxes = (selected_boxes_inv + refined_bbox_deltas).sigmoid()
+        all_refined_logits = []
+        all_refined_boxes = []
+
+        for layer_idx, layer in enumerate(self.re_attention):
+            refined_query_embed = layer(
+                query=refined_query_embed,
+                reference_points=refined_references, # Remove detach
+                src_flatten=memory,
+                src_spatial_shapes=spatial_shapes,
+                src_level_start_index=level_start_index
+            )
+
+            # 3. Refined Prediction
+            refined_class_logits = self.re_attention_class_embed[layer_idx](refined_query_embed)
+            refined_bbox_deltas = self.re_attention_bbox_embed[layer_idx](refined_query_embed)
+            
+            # Apply deltas to selected boxes (inverse sigmoid -> add delta -> sigmoid)
+            refined_references_inv = inverse_sigmoid(refined_references)
+            refined_references = (refined_references_inv + refined_bbox_deltas).sigmoid()
+            
+            all_refined_logits.append(refined_class_logits)
+            all_refined_boxes.append(refined_references)
 
         # 4. Merge results (Optional: overwrite or return as separate output)
         # Here we return them as 'refined_outputs'
         
         out = {'pred_logits': final_class, 'pred_boxes': final_coord}
-        out['refined_outputs'] = {'pred_logits': refined_class_logits, 'pred_boxes': refined_boxes, 'indexes': topk_indexes}
+        out['refined_outputs'] = {'pred_logits': all_refined_logits[-1], 'pred_boxes': all_refined_boxes[-1], 'indexes': topk_indexes}
+        
+        if len(all_refined_logits) > 1:
+             out['refined_intermediate_outputs'] = [{'pred_logits': a, 'pred_boxes': b, 'indexes': topk_indexes}
+                for a, b in zip(all_refined_logits[:-1], all_refined_boxes[:-1])]
         
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
@@ -464,6 +486,19 @@ class SetCriterion(nn.Module):
                 l_dict = {k + '_refined': v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
+        if 'refined_intermediate_outputs' in outputs:
+            for i, refined_outputs in enumerate(outputs['refined_intermediate_outputs']):
+                indices = self.matcher(refined_outputs, targets)
+                for loss in self.losses:
+                    if loss == 'masks':
+                        continue
+                    kwargs = {}
+                    if loss == 'labels':
+                        kwargs['log'] = False
+                    l_dict = self.get_loss(loss, refined_outputs, targets, indices, num_boxes, **kwargs)
+                    l_dict = {k + f'_refined_{i}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+
         return losses
 
 
@@ -553,8 +588,13 @@ def build(args):
         weight_dict["loss_dice"] = args.dice_loss_coef
     
     # Add weights for refined outputs
-    refined_weight_dict = {k + '_refined': v for k, v in weight_dict.items() if k in ['loss_ce', 'loss_bbox', 'loss_giou']}
+    refined_weight_dict = {k + '_refined': v * 2.0 for k, v in weight_dict.items() if k in ['loss_ce', 'loss_bbox', 'loss_giou']}
     weight_dict.update(refined_weight_dict)
+    
+    # Add weights for refined intermediate outputs
+    for i in range(5):
+        refined_inter_weight_dict = {k + f'_refined_{i}': v * 2.0 for k, v in weight_dict.items() if k in ['loss_ce', 'loss_bbox', 'loss_giou']}
+        weight_dict.update(refined_inter_weight_dict)
 
     # TODO this is a hack
     if args.aux_loss:

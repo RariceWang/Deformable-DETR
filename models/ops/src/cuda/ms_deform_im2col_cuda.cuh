@@ -53,25 +53,25 @@ __device__ scalar_t ms_deform_attn_im2col_bilinear(const scalar_t* &bottom_data,
   const int base_ptr = m * channels + c;
 
   scalar_t v1 = 0;
-  if (h_low >= 0 && w_low >= 0)
+  if (h_low >= 0 && w_low >= 0 && h_low < height && w_low < width)
   {
     const int ptr1 = h_low_ptr_offset + w_low_ptr_offset + base_ptr;
     v1 = bottom_data[ptr1];
   }
   scalar_t v2 = 0;
-  if (h_low >= 0 && w_high <= width - 1)
+  if (h_low >= 0 && w_high <= width - 1 && h_low < height && w_high >= 0)
   {
     const int ptr2 = h_low_ptr_offset + w_high_ptr_offset + base_ptr;
     v2 = bottom_data[ptr2];
   }
   scalar_t v3 = 0;
-  if (h_high <= height - 1 && w_low >= 0)
+  if (h_high <= height - 1 && w_low >= 0 && h_high >= 0 && w_low < width)
   {
     const int ptr3 = h_high_ptr_offset + w_low_ptr_offset + base_ptr;
     v3 = bottom_data[ptr3];
   }
   scalar_t v4 = 0;
-  if (h_high <= height - 1 && w_high <= width - 1)
+  if (h_high <= height - 1 && w_high <= width - 1 && h_high >= 0 && w_high >= 0)
   {
     const int ptr4 = h_high_ptr_offset + w_high_ptr_offset + base_ptr;
     v4 = bottom_data[ptr4];
@@ -116,7 +116,7 @@ __device__ void ms_deform_attn_col2im_bilinear(const scalar_t* &bottom_data,
   scalar_t grad_h_weight = 0, grad_w_weight = 0;
 
   scalar_t v1 = 0;
-  if (h_low >= 0 && w_low >= 0)
+  if (h_low >= 0 && w_low >= 0 && h_low < height && w_low < width)
   {
     const int ptr1 = h_low_ptr_offset + w_low_ptr_offset + base_ptr;
     v1 = bottom_data[ptr1];
@@ -125,7 +125,7 @@ __device__ void ms_deform_attn_col2im_bilinear(const scalar_t* &bottom_data,
     atomicAdd(grad_value+ptr1, w1*top_grad_value);
   }
   scalar_t v2 = 0;
-  if (h_low >= 0 && w_high <= width - 1)
+  if (h_low >= 0 && w_high <= width - 1 && h_low < height && w_high >= 0)
   {
     const int ptr2 = h_low_ptr_offset + w_high_ptr_offset + base_ptr;
     v2 = bottom_data[ptr2];
@@ -134,7 +134,7 @@ __device__ void ms_deform_attn_col2im_bilinear(const scalar_t* &bottom_data,
     atomicAdd(grad_value+ptr2, w2*top_grad_value);
   }
   scalar_t v3 = 0;
-  if (h_high <= height - 1 && w_low >= 0)
+  if (h_high <= height - 1 && w_low >= 0 && h_high >= 0 && w_low < width)
   {
     const int ptr3 = h_high_ptr_offset + w_low_ptr_offset + base_ptr;
     v3 = bottom_data[ptr3];
@@ -143,7 +143,7 @@ __device__ void ms_deform_attn_col2im_bilinear(const scalar_t* &bottom_data,
     atomicAdd(grad_value+ptr3, w3*top_grad_value); 
   }
   scalar_t v4 = 0;
-  if (h_high <= height - 1 && w_high <= width - 1)
+  if (h_high <= height - 1 && w_high <= width - 1 && h_high >= 0 && w_high >= 0)
   {
     const int ptr4 = h_high_ptr_offset + w_high_ptr_offset + base_ptr;
     v4 = bottom_data[ptr4];
@@ -191,7 +191,7 @@ __device__ void ms_deform_attn_col2im_bilinear_gm(const scalar_t* &bottom_data,
   scalar_t grad_h_weight = 0, grad_w_weight = 0;
 
   scalar_t v1 = 0;
-  if (h_low >= 0 && w_low >= 0)
+  if (h_low >= 0 && w_low >= 0 && h_low < height && w_low < width)
   {
     const int ptr1 = h_low_ptr_offset + w_low_ptr_offset + base_ptr;
     v1 = bottom_data[ptr1];
@@ -200,7 +200,7 @@ __device__ void ms_deform_attn_col2im_bilinear_gm(const scalar_t* &bottom_data,
     atomicAdd(grad_value+ptr1, w1*top_grad_value);
   }
   scalar_t v2 = 0;
-  if (h_low >= 0 && w_high <= width - 1)
+  if (h_low >= 0 && w_high <= width - 1 && h_low < height && w_high >= 0)
   {
     const int ptr2 = h_low_ptr_offset + w_high_ptr_offset + base_ptr;
     v2 = bottom_data[ptr2];
@@ -209,7 +209,7 @@ __device__ void ms_deform_attn_col2im_bilinear_gm(const scalar_t* &bottom_data,
     atomicAdd(grad_value+ptr2, w2*top_grad_value);
   }
   scalar_t v3 = 0;
-  if (h_high <= height - 1 && w_low >= 0)
+  if (h_high <= height - 1 && w_low >= 0 && h_high >= 0 && w_low < width)
   {
     const int ptr3 = h_high_ptr_offset + w_low_ptr_offset + base_ptr;
     v3 = bottom_data[ptr3];
@@ -218,7 +218,7 @@ __device__ void ms_deform_attn_col2im_bilinear_gm(const scalar_t* &bottom_data,
     atomicAdd(grad_value+ptr3, w3*top_grad_value); 
   }
   scalar_t v4 = 0;
-  if (h_high <= height - 1 && w_high <= width - 1)
+  if (h_high <= height - 1 && w_high <= width - 1 && h_high >= 0 && w_high >= 0)
   {
     const int ptr4 = h_high_ptr_offset + w_high_ptr_offset + base_ptr;
     v4 = bottom_data[ptr4];
