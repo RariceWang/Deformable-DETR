@@ -25,6 +25,7 @@ from .matcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
 from .deformable_transformer import build_deforamble_transformer
+from .dist_utils import DistributionHead
 import copy
 
 
@@ -35,7 +36,7 @@ def _get_clones(module, N):
 class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False):
+                 aux_loss=True, with_box_refine=False, two_stage=False, n_bins=32):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -52,7 +53,10 @@ class DeformableDETR(nn.Module):
         self.transformer = transformer
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
-        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.n_bins = n_bins
+        self.dist_head = DistributionHead(reg_max=n_bins)
+        # 4 coordinates * (n_bins + 1)
+        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4 * (n_bins + 1), 3)
         self.num_feature_levels = num_feature_levels
         if not two_stage:
             self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
@@ -158,28 +162,45 @@ class DeformableDETR(nn.Module):
 
         outputs_classes = []
         outputs_coords = []
+        outputs_dists = []
+        outputs_entropies = []
         for lvl in range(hs.shape[0]):
             if lvl == 0:
                 reference = init_reference
             else:
                 reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
+            
             outputs_class = self.class_embed[lvl](hs[lvl])
             tmp = self.bbox_embed[lvl](hs[lvl])
-            if reference.shape[-1] == 4:
-                tmp += reference
-            else:
-                assert reference.shape[-1] == 2
-                tmp[..., :2] += reference
-            outputs_coord = tmp.sigmoid()
+            
+            box_vals, entropy, _ = self.dist_head(tmp)
+            
+            ref_cx, ref_cy = reference[..., 0], reference[..., 1]
+            l, t, r, b = box_vals.unbind(-1)
+            new_cx = ref_cx + (r - l) * 0.5
+            new_cy = ref_cy + (b - t) * 0.5
+            new_w = l + r
+            new_h = t + b
+            outputs_coord = torch.stack([new_cx, new_cy, new_w, new_h], -1)
+            
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
+            outputs_dists.append(tmp)
+            outputs_entropies.append(entropy)
+            
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
+        outputs_dist = torch.stack(outputs_dists)
+        outputs_entropy = torch.stack(outputs_entropies)
 
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        out = {
+            'pred_logits': outputs_class[-1],
+            'pred_boxes': outputs_coord[-1],
+            'pred_dist': outputs_dist[-1],
+            'pred_entropy': outputs_entropy[-1]
+        }
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_dist, outputs_entropy)
 
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
@@ -187,12 +208,12 @@ class DeformableDETR(nn.Module):
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_dist, outputs_entropy):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b}
-                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+        return [{'pred_logits': a, 'pred_boxes': b, 'pred_dist': c, 'pred_entropy': d}
+                for a, b, c, d in zip(outputs_class[:-1], outputs_coord[:-1], outputs_dist[:-1], outputs_entropy[:-1])]
 
 
 class SetCriterion(nn.Module):
@@ -356,6 +377,7 @@ class SetCriterion(nn.Module):
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
+            teacher_dist = outputs.get('pred_dist')
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
@@ -369,6 +391,20 @@ class SetCriterion(nn.Module):
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+                
+                # Self-Distillation
+                if teacher_dist is not None and 'pred_dist' in aux_outputs:
+                    # teacher_dist: [B, Q, 4 * (n_bins + 1)]
+                    n_bins_plus_1 = teacher_dist.shape[-1] // 4
+                    T = teacher_dist.detach().reshape(-1, n_bins_plus_1)
+                    S = aux_outputs['pred_dist'].reshape(-1, n_bins_plus_1)
+                    
+                    T_prob = F.softmax(T, dim=-1)
+                    S_log_prob = F.log_softmax(S, dim=-1)
+                    
+                    loss_distill = F.kl_div(S_log_prob, T_prob, reduction='batchmean')
+                    losses[f'loss_distill_{i}'] = loss_distill
+
 
         if 'enc_outputs' in outputs:
             enc_outputs = outputs['enc_outputs']
@@ -465,6 +501,7 @@ def build(args):
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict['loss_distill'] = 1.0
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef
