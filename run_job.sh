@@ -6,6 +6,7 @@ export PYTHONPATH=$PYTHONPATH:/workspace:/workspace/models/ops
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python main.py \
     --coco_path /workspace/data/coco/ \
+    --resume /workspace/checkpoint/checkpoint.pth \
     --output_dir /output/Deformable-DETR/ \
     --batch_size 1 \
     --num_workers 4 \
