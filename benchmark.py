@@ -54,7 +54,7 @@ def benchmark():
     model.cuda()
     model.eval()
     if args.resume is not None:
-        ckpt = torch.load(args.resume, map_location=lambda storage, loc: storage)
+        ckpt = torch.load(args.resume, map_location=lambda storage, loc: storage, weights_only=False)
         model.load_state_dict(ckpt['model'])
     inputs = nested_tensor_from_tensor_list([dataset.__getitem__(0)[0].cuda() for _ in range(args.batch_size)])
     t = measure_average_inference_time(model, inputs, args.num_iters, args.warm_iters)
