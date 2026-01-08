@@ -95,6 +95,13 @@ class DeformableDETR(nn.Module):
         self.class_embed.bias.data = torch.ones(num_classes) * bias_value
         nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
+        # Initialize bias to favor small boxes (peaked at 0 for l,t,r,b)
+        # 4 coords * 16 bins
+        # Reshape bias to [4, 16] and set 0-th bin to high value
+        bias = self.bbox_embed.layers[-1].bias.data.view(4, self.n_bins)
+        bias[:, 0] = 5.0 # High value for 0-th bin (offset=0)
+        self.bbox_embed.layers[-1].bias.data = bias.view(-1)
+        
         for proj in self.input_proj:
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)

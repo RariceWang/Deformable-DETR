@@ -106,7 +106,7 @@ def get_args_parser():
     parser.add_argument('--focal_alpha', default=0.25, type=float)
 
     # * Dynamic Routing & Distillation
-    parser.add_argument('--dynamic_routing', default=False, action='store_true',
+    parser.add_argument('--dynamic_routing', default=True, action='store_true',
                         help="Enable uncertainty-aware dynamic routing during inference")
     parser.add_argument('--thresh_cls', default=0.7, type=float,
                         help="Confidence threshold for dynamic routing")
