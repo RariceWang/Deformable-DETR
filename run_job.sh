@@ -8,7 +8,7 @@ python main.py \
     --coco_path /workspace/data/coco/ \
     --resume /workspace/checkpoint/checkpoint.pth \
     --output_dir /output/Deformable-DETR/ \
-    --batch_size 1 \
+    --batch_size 8 \
     --num_workers 4 \
     --backbone resnet50 \
     --distill_loss_coef 1.0
